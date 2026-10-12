@@ -36,13 +36,52 @@ Sinh viên phải tự tay chứng minh được: sửa 1 ký tự trong 1 dòng
 rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
-
+import hashlib
+import json
 from pathlib import Path
-
-
+def _compute_hash(data: dict) -> str:
+    # Tính SHA-256 trên nội dung entry (bỏ qua field 'hash')
+    entry_without_hash = {k: v for k, v in data.items() if k != "hash"}
+    serialized = json.dumps(entry_without_hash, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
-
-
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev_hash = "0" * 64
+    if path.exists():
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            try:
+                last_entry = json.loads(lines[-1])
+                prev_hash = last_entry.get("hash", "0" * 64)
+            except Exception:
+                prev_hash = "0" * 64
+    full_entry = dict(entry)
+    full_entry["prev_hash"] = prev_hash
+    full_entry["hash"] = _compute_hash(full_entry)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(full_entry, sort_keys=True, ensure_ascii=False) + "\n")
+    return full_entry
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    if not path.exists():
+        return True
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return True
+    expected_prev = "0" * 64
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except Exception:
+            return False
+        # Kiểm tra reason không được để trống
+        if not entry.get("reason"):
+            return False
+        # Kiểm tra chuỗi liên kết hash
+        if entry.get("prev_hash") != expected_prev:
+            return False
+        # Kiểm tra tính toàn vẹn của nội dung dòng
+        stored_hash = entry.get("hash")
+        if not stored_hash or stored_hash != _compute_hash(entry):
+            return False
+        expected_prev = stored_hash
+    return True

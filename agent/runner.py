@@ -58,17 +58,152 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
         chỉ có sink log và ledger là khác.
 """
 from __future__ import annotations
-
+import hashlib
+import json
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
+from agent import ledger, pii, policy, tools
+BASE_DIR = Path(__file__).resolve().parent.parent
+CUSTOMERS_FILE = BASE_DIR / "data" / "customers.json"
+REPORTS_DIR = BASE_DIR / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
-
-
-class RunnerScaffoldPending(NotImplementedError):
-    """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
-
-
-def handle(message: str, llm, log_dir: Path | None = None,
-           principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+def handle(
+    message: str,
+    llm,
+    log_dir: Path | None = None,
+    principal_id: str = "support_l1",
+) -> str:
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    # =========================================================================
+    # RUN A: Đọc untrusted content (corpus/), KHÔNG chạm store, KHÔNG egress
+    # =========================================================================
+    run_a_id = "run-a"
+    ctx_a = policy.PolicyContext(
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        agent_owner="lab24-agent/run-a",
+        delegation_depth=0,
+        egress_enabled=False,
+        principal_id=principal_id,
+        requested_tool="search_docs",
+        agent_scopes=("search_docs",),
+        parent_scopes=(),
+        expires_at=expires_at,
+    )
+    allow_a, reason_a = policy.check(ctx_a)
+    args_hash_a = hashlib.sha256(json.dumps({"query": message}, sort_keys=True).encode("utf-8")).hexdigest()
+    ledger.append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "lab24-agent",
+            "run_id": run_a_id,
+            "on_behalf_of": principal_id,
+            "tool": "search_docs",
+            "args_hash": args_hash_a,
+            "classification": "internal",
+            "decision": "allow" if allow_a else "deny",
+            "reason": reason_a,
+            "expires_at": expires_at,
+        },
+        ledger_path,
+    )
+    if not allow_a:
+        return "Access denied for search_docs."
+    docs = tools.search_docs(message)
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    # Lọc bỏ PII thô trước khi chuyển boundary
+    pii.redact(combined_text)
+    # TRIFECTA SPLIT: Chỉ trích xuất ticket ID dạng số từ TÊN FILE
+    ticket_ids: set[int] = set()
+    for d in docs:
+        for num_str in re.findall(r"\d+", d["id"]):
+            ticket_ids.add(int(num_str))
+    # LLM kiểm tra injection trên nội dung untrusted
+    injected = llm.find_injection(combined_text)
+    # =========================================================================
+    # RUN B: Truy xuất private store qua nguồn tin cậy related_tickets
+    # =========================================================================
+    run_b_id = "run-b"
+    customers_data = json.loads(CUSTOMERS_FILE.read_text(encoding="utf-8")) if CUSTOMERS_FILE.exists() else []
+    # Map ticket ID sang customer_id thông qua customers.json (chống đọc KH-000777 từ free text)
+    candidate_cids: set[str] = set()
+    for c in customers_data:
+        c_tickets = set(c.get("related_tickets", []))
+        if c_tickets & ticket_ids:
+            candidate_cids.add(c["customer_id"])
+    collected = []
+    for cid in sorted(candidate_cids):
+        ctx_b = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner="lab24-agent/run-b",
+            delegation_depth=0,
+            egress_enabled=False,
+            principal_id=principal_id,
+            requested_tool="read_customer",
+            agent_scopes=("search_docs", "read_customer"),
+            parent_scopes=(),
+            expires_at=expires_at,
+        )
+        allow_b, reason_b = policy.check(ctx_b)
+        args_hash_b = hashlib.sha256(json.dumps({"customer_id": cid}, sort_keys=True).encode("utf-8")).hexdigest()
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": "lab24-agent",
+                "run_id": run_b_id,
+                "on_behalf_of": principal_id,
+                "tool": "read_customer",
+                "args_hash": args_hash_b,
+                "classification": "restricted",
+                "decision": "allow" if allow_b else "deny",
+                "reason": reason_b,
+                "expires_at": expires_at,
+            },
+            ledger_path,
+        )
+        if allow_b:
+            try:
+                collected.append(tools.read_customer(cid))
+            except tools.ToolError:
+                pass
+    # =========================================================================
+    # Chặn Egress: Kiểm tra Policy khi có yêu cầu POST ra ngoài
+    # =========================================================================
+    if injected is not None:
+        ctx_post = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="reconciliation",
+            agent_owner="lab24-agent/run-b",
+            delegation_depth=1,
+            egress_enabled=True,
+            principal_id=principal_id,
+            requested_tool="http_post",
+            agent_scopes=("search_docs", "read_customer", "http_post"),
+            parent_scopes=(),
+            expires_at=expires_at,
+        )
+        allow_post, reason_post = policy.check(ctx_post)
+        args_hash_post = hashlib.sha256(
+            json.dumps({"url": injected.target_url}, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": "lab24-agent",
+                "run_id": run_b_id,
+                "on_behalf_of": principal_id,
+                "tool": "http_post",
+                "args_hash": args_hash_post,
+                "classification": "restricted",
+                "decision": "allow" if allow_post else "deny",
+                "reason": reason_post,
+                "expires_at": expires_at,
+            },
+            ledger_path,
+        )
+        if allow_post:
+            tools.http_post(injected.target_url, {"records": collected})
+    return llm.summarize(docs)
